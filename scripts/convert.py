@@ -1,32 +1,78 @@
 
+import json
 import os
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Optional
+from enum import Enum
 
-from transformers import AutoTokenizer, HfArgumentParser
-from transformers.utils import cached_file
-from tqdm import tqdm
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    HfArgumentParser
+)
 
-from optimum.utils import DEFAULT_DUMMY_SHAPES
+import onnxslim
+from optimum.exporters.onnx import main_export, export_models
+from optimum.onnx.graph_transformations import check_and_save_model
 from optimum.exporters.tasks import TasksManager
-from optimum.exporters.onnx.utils import (
-    get_decoder_models_for_export,
-    get_encoder_decoder_models_for_export
-)
-from optimum.exporters.onnx.convert import export_models
-from optimum.onnx.graph_transformations import merge_decoders
-from optimum.onnxruntime.utils import (
-    ONNX_WEIGHTS_NAME,
-    ONNX_ENCODER_NAME,
-    ONNX_DECODER_NAME,
-    ONNX_DECODER_WITH_PAST_NAME,
-    ONNX_DECODER_MERGED_NAME
-)
-from onnxruntime.quantization import (
-    quantize_dynamic,
-    QuantType
-)
+
+from .quantize import QuantizationArguments, quantize
+
+NO_PER_CHANNEL_REDUCE_RANGE_MODELS = {
+    # Decoder-only models
+    'codegen',
+    'gpt2',
+    'gpt_bigcode',
+    'gptj',
+    'gpt-neo',
+    'gpt-neox',
+    'mpt',
+    'bloom',
+    'llama',
+    'gemma',
+    'opt',
+    'mistral',
+    'falcon',
+    'phi',
+    'phi3',
+    'qwen2',
+    'stablelm',
+    'starcoder2',
+    'openelm',
+    'mobilellm',
+    'olmo',
+
+    # Encoder-decoder models
+    'whisper',
+    'vision-encoder-decoder',
+
+    # Encoder-only models
+    'owlv2',
+    'wavlm',
+    'wav2vec2',
+    'unispeech',
+    'unispeech-sat',
+}
+
+MODELS_WITHOUT_TOKENIZERS = [
+    'wav2vec2',
+    'wav2vec2-bert',
+    'wavlm',
+    'hubert',
+    'unispeech',
+    'unispeech-sat',
+]
+
+
+class QuantMode(Enum):
+    # F32 = 'fp32'
+    FP16 = 'fp16'
+    Q8 = 'q8'
+    QI8 = 'int8'
+    QU8 = 'uint8'
+    Q4 = 'q4'
+    BNB4 = 'bnb4'
 
 
 @dataclass
@@ -40,35 +86,50 @@ class ConversionArguments:
             "help": "Model identifier"
         }
     )
+    tokenizer_id: str = field(
+        default=None,
+        metadata={
+            "help": "Tokenizer identifier (if different to `model_id`)"
+        }
+    )
     quantize: bool = field(
         default=False,
         metadata={
             "help": "Whether to quantize the model."
         }
     )
-    input_parent_dir: str = field(
-        default='./models/pytorch/',
-        metadata={
-            "help": "Path where the original model will be loaded from."
-        }
-    )
     output_parent_dir: str = field(
-        default='./models/onnx/',
+        default='./models/',
         metadata={
             "help": "Path where the converted model will be saved to."
         }
     )
 
     task: Optional[str] = field(
-        default='default',
+        default='auto',
         metadata={
             "help": (
                 "The task to export the model for. If not specified, the task will be auto-inferred based on the model. Available tasks depend on the model, but are among:"
-                f" {str(list(TasksManager._TASKS_TO_AUTOMODELS.keys()))}. For decoder models, use `xxx-with-past` to export the model using past key values in the decoder."
+                f" {str(TasksManager.get_all_tasks())}. For decoder models, use `xxx-with-past` to export the model using past key values in the decoder."
+            )
+        }
+    )
+    library_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "The library name to use for the export. If not specified, the library name will be auto-inferred based on the model."
             )
         }
     )
 
+
+    variant: Optional[str] = field(
+        default='default',
+        metadata={
+            "help": "The variant of the ONNX export to use."
+        }
+    )
     opset: int = field(
         default=None,
         metadata={
@@ -84,226 +145,309 @@ class ConversionArguments:
             "help": 'The device to use to do the export.'
         }
     )
-    from_hub: bool = field(
+    skip_validation: bool = field(
         default=False,
         metadata={
-            "help": "Whether to use local files, or from the HuggingFace Hub."
+            "help": "Whether to skip validation of the converted model"
         }
     )
-    merge_decoders: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to fuse decoder ONNX model and decoder with past ONNX model into one ONNX model with if logic"
-        }
-    )
-    overwrite: bool = field(
+
+    output_attentions: bool = field(
         default=False,
         metadata={
-            "help": "Whether to overwriting existing models"
+            "help": "Whether to output attentions from the model. NOTE: This is only supported for whisper models right now."
         }
     )
 
+    split_modalities: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to split multimodal models. NOTE: This is only supported for CLIP models right now."
+        }
+    )
 
-UNSIGNED_MODEL_TYPES = [
-    'whisper',
-    'vision-encoder-decoder',
-    'vit',
-    'clip',
-    'detr',
-    'squeezebert',
-]
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": "Allows to use custom code for the modeling hosted in the model repository. This option should only be set for repositories"
+            "you trust and in which you have read the code, as it will execute on your local machine arbitrary code present in the model repository."
+        }
+    )
 
-
-def quantize(models_name_or_path, model_type):
-    """
-    Quantize the weights of the model from float32 to int8 to allow very efficient inference on modern CPU
-
-    Uses unsigned ints for activation values, signed ints for weights, per
-    https://onnxruntime.ai/docs/performance/quantization.html#data-type-selection
-    it is faster on most CPU architectures
-    Args:
-        onnx_model_path: Path to location the exported ONNX model is stored
-    Returns: The Path generated for the quantized
-    """
-
-    # As per docs, signed weight type (QInt8) is faster on most CPUs
-    # However, for some model types (e.g., whisper), we have to use
-    # unsigned weight type (QUInt8). For more info:
-    # https://github.com/microsoft/onnxruntime/issues/3130#issuecomment-1105200621
-
-    if model_type in UNSIGNED_MODEL_TYPES:
-        weight_type = QuantType.QUInt8
-    else:
-        # Default
-        weight_type = QuantType.QInt8
-
-    for model in tqdm(models_name_or_path, desc='Quantizing'):
-        # model_name = os.path.splitext(os.path.basename(model))[0]
-        quantize_dynamic(
-            model_input=model,
-            model_output=model,
-            per_channel=True,
-            reduce_range=True,  # should be the same as per_channel
-
-            weight_type=weight_type,
-            optimize_model=False,
-        )  # op_types_to_quantize=['MatMul', 'Relu', 'Add', 'Mul' ],
-
-
-def copy_if_exists(model_path, file_name, destination):
-    file = cached_file(model_path, file_name,
-                       _raise_exceptions_for_missing_entries=False)
-    if file is not None:
-        shutil.copy(file, destination)
-
+    custom_onnx_configs: str = field(
+        default=None,
+        metadata={
+            "help": "Experimental usage: override the default ONNX config used for the given model. This argument may be useful for advanced users "
+            "that desire a finer-grained control on the export."
+        }
+    )
+    skip_onnxslim: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether or not to skip onnxslim."
+        }
+    )
 
 def main():
 
     parser = HfArgumentParser(
-        (ConversionArguments, )
+        (ConversionArguments, QuantizationArguments)
     )
-    conv_args, = parser.parse_args_into_dataclasses()
+    conv_args, quantization_args = parser.parse_args_into_dataclasses()
 
-    input_model_path = os.path.join(
-        conv_args.input_parent_dir,
-        conv_args.model_id
-    )
-    if conv_args.from_hub:
-        model_path = conv_args.model_id
-    else:
-        model_path = input_model_path
+    model_id = conv_args.model_id
+    tokenizer_id = conv_args.tokenizer_id or model_id
 
-    # Infer the task
-    task = conv_args.task
-    if task == "auto":
-        try:
-            task = TasksManager.infer_task_from_model(model_path)
-        except KeyError as e:
-            raise KeyError(
-                f"The task could not be automatically inferred. Please provide the argument --task with the task from {', '.join(TasksManager.get_all_tasks())}. Detailed error: {e}"
-            )
-
-    output_model_folder = os.path.join(
-        conv_args.output_parent_dir,
-        'quantized' if conv_args.quantize else 'unquantized',
-        conv_args.model_id,
-        task
-    )
-
-    # get the shapes to be used to generate dummy inputs
-    input_shapes = DEFAULT_DUMMY_SHAPES.copy()
-
-    model = TasksManager.get_model_from_task(
-        task, model_path,
-        framework='pt',
-    )
-
-    onnx_config_constructor = TasksManager.get_exporter_config_constructor(
-        model=model, exporter='onnx', task=task)
-    onnx_config = onnx_config_constructor(model.config)
-
-    # Ensure the requested opset is sufficient
-    if conv_args.opset is None:
-        conv_args.opset = onnx_config.DEFAULT_ONNX_OPSET
-    elif conv_args.opset < onnx_config.DEFAULT_ONNX_OPSET:
-        raise ValueError(
-            f"Opset {conv_args.opset} is not sufficient to export {model.config.model_type}. "
-            f"At least  {onnx_config.DEFAULT_ONNX_OPSET} is required."
-        )
+    output_model_folder = os.path.join(conv_args.output_parent_dir, model_id)
 
     # Create output folder
     os.makedirs(output_model_folder, exist_ok=True)
 
-    # Copy certain JSON files, which save_pretrained doesn't handle
-    copy_if_exists(model_path, 'tokenizer.json', output_model_folder)
-    copy_if_exists(model_path, 'preprocessor_config.json', output_model_folder)
-
-    if model.can_generate():
-        copy_if_exists(model_path, 'generation_config.json',
-                       output_model_folder)
+    from_pretrained_kwargs = dict(
+        trust_remote_code=conv_args.trust_remote_code,
+    )
 
     # Saving the model config
-    model.config.save_pretrained(output_model_folder)
+    config = AutoConfig.from_pretrained(model_id, **from_pretrained_kwargs)
 
+    custom_kwargs = {}
+    if conv_args.custom_onnx_configs is not None:
+        if conv_args.task == 'auto':
+            raise Exception(
+                '`--task` must be set when exporting with `--custom_onnx_configs`')
+        custom_onnx_configs = json.loads(conv_args.custom_onnx_configs)
+
+        for key in custom_onnx_configs:
+            onnx_configs = TasksManager._SUPPORTED_MODEL_TYPE[custom_onnx_configs[key]]['onnx']
+            mapping = onnx_configs[conv_args.task]
+            new_kwargs = {}
+            if conv_args.task.startswith('text-generation'):
+                new_kwargs['use_past_in_inputs'] = True
+
+            custom_onnx_configs[key] = mapping.func(
+                config, **mapping.keywords, **new_kwargs)
+
+        custom_kwargs['custom_onnx_configs'] = custom_onnx_configs
+
+    tokenizer = None
     try:
-        # Save tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        tokenizer.save_pretrained(output_model_folder)
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, **from_pretrained_kwargs)
 
-        # Handle special cases
-        if model.config.model_type == 'marian':
-            import json
-            from .extra.marian import generate_tokenizer_json
-            tokenizer_json = generate_tokenizer_json(model_path, tokenizer)
-
-            with open(os.path.join(output_model_folder, 'tokenizer.json'), 'w', encoding='utf-8') as fp:
-                json.dump(tokenizer_json, fp)
     except KeyError:
         pass  # No Tokenizer
 
-    # Specify output paths
-    OUTPUT_WEIGHTS_PATH = os.path.join(output_model_folder, ONNX_WEIGHTS_NAME)
-    OUTPUT_ENCODER_PATH = os.path.join(output_model_folder, ONNX_ENCODER_NAME)
-    OUTPUT_DECODER_PATH = os.path.join(output_model_folder, ONNX_DECODER_NAME)
-    OUTPUT_DECODER_WITH_PAST_PATH = os.path.join(
-        output_model_folder, ONNX_DECODER_WITH_PAST_NAME)
-    OUTPUT_DECODER_MERGED_PATH = os.path.join(
-        output_model_folder, ONNX_DECODER_MERGED_NAME)
+    except Exception as e:
+        if config.model_type not in MODELS_WITHOUT_TOKENIZERS:
+            raise e
+
+    core_export_kwargs = dict(
+        opset=conv_args.opset,
+        device=conv_args.device,
+        trust_remote_code=conv_args.trust_remote_code,
+        **custom_kwargs,
+    )
+
+    export_kwargs = dict(
+        model_name_or_path=model_id,
+        output=output_model_folder,
+        task=conv_args.task,
+        do_validation=not conv_args.skip_validation,
+        _variant=conv_args.variant,
+        library_name=conv_args.library_name,
+        **core_export_kwargs,
+    )
+
+    # Handle special cases
+    if config.model_type == 'marian':
+        from .extra.marian import generate_tokenizer_json
+        tokenizer_json = generate_tokenizer_json(model_id, tokenizer)
+
+        with open(os.path.join(output_model_folder, 'tokenizer.json'), 'w', encoding='utf-8') as fp:
+            json.dump(tokenizer_json, fp, indent=4)
+
+    elif config.model_type == 'esm':
+        from .extra.esm import generate_fast_tokenizer
+        fast_tokenizer = generate_fast_tokenizer(tokenizer)
+        fast_tokenizer.save(os.path.join(
+            output_model_folder, 'tokenizer.json'))
+
+    elif config.model_type == 'whisper':
+        if conv_args.output_attentions:
+            from .extra.whisper import get_main_export_kwargs
+
+            export_kwargs.update(
+                **get_main_export_kwargs(config, "automatic-speech-recognition")
+            )
+
+    elif config.model_type in ('wav2vec2', 'wav2vec2-bert', 'hubert', 'unispeech', 'unispeech-sat'):
+        if tokenizer is not None:
+            from .extra.wav2vec2 import generate_tokenizer_json
+            tokenizer_json = generate_tokenizer_json(tokenizer)
+
+            with open(os.path.join(output_model_folder, 'tokenizer.json'), 'w', encoding='utf-8') as fp:
+                json.dump(tokenizer_json, fp, indent=4)
+
+    elif config.model_type == 'vits':
+        if tokenizer is not None:
+            from .extra.vits import generate_tokenizer_json
+            tokenizer_json = generate_tokenizer_json(tokenizer)
+
+            with open(os.path.join(output_model_folder, 'tokenizer.json'), 'w', encoding='utf-8') as fp:
+                json.dump(tokenizer_json, fp, indent=4)
+
+    elif config.model_type == 'speecht5':
+        # TODO allow user to specify vocoder path
+        export_kwargs["model_kwargs"] = {
+            "vocoder": "microsoft/speecht5_hifigan"}
+
+        if tokenizer is not None:
+            from .extra.speecht5 import generate_tokenizer_json
+            tokenizer_json = generate_tokenizer_json(tokenizer)
+
+            with open(os.path.join(output_model_folder, 'tokenizer.json'), 'w', encoding='utf-8') as fp:
+                json.dump(tokenizer_json, fp, indent=4)
+
+    elif config.model_type in ('owlvit', 'owlv2'):
+        # Override default batch size to 1, needed because non-maximum suppression is performed for exporting.
+        # For more information, see https://github.com/huggingface/optimum/blob/e3b7efb1257c011db907ef40ab340e795cc5684c/optimum/exporters/onnx/model_configs.py#L1028-L1032
+        export_kwargs['batch_size'] = 1
+
+    elif config.model_type == 'openelm':
+        from .extra.openelm import OpenElmOnnxConfig
+
+        config = AutoConfig.from_pretrained(
+            model_id, trust_remote_code=conv_args.trust_remote_code)
+
+        onnx_config = OpenElmOnnxConfig(
+            config=config,
+            task="text-generation",
+            use_past=True,
+            use_past_in_inputs=True,
+        )
+
+        custom_onnx_configs = {
+            "model": onnx_config,
+        }
+
+        export_kwargs['task'] = "text-generation-with-past"
+        export_kwargs['custom_onnx_configs'] = custom_onnx_configs
+
+    else:
+        pass  # TODO
 
     # Step 1. convert huggingface model to onnx
-    if model.config.is_encoder_decoder and task.startswith("causal-lm"):
-        raise ValueError(
-            f"model.config.is_encoder_decoder is True and task is `{task}`, which are incompatible. If the task was auto-inferred, please fill a bug report"
-            f"at https://github.com/huggingface/optimum, if --task was explicitely passed, make sure you selected the right task for the model,"
-            f" referring to `optimum.exporters.tasks.TaskManager`'s `_TASKS_TO_AUTOMODELS`."
-        )
-
-    if (
-        model.config.is_encoder_decoder
-        and task.startswith(("seq2seq-lm", "speech2seq-lm", "vision2seq-lm", "default-with-past"))
-    ):
-        models_and_onnx_configs = get_encoder_decoder_models_for_export(
-            model, onnx_config)
-    elif task.startswith("causal-lm"):
-        models_and_onnx_configs = get_decoder_models_for_export(
-            model, onnx_config)
+    if not conv_args.split_modalities:
+        main_export(**export_kwargs)
     else:
-        models_and_onnx_configs = {"model": (model, onnx_config)}
-
-    onnx_model_paths = [
-        os.path.join(output_model_folder, f'{x}.onnx')
-        for x in models_and_onnx_configs
-    ]
-
-    # Check if at least one model doesn't exist, or user requests to overwrite
-    if any(
-        not os.path.exists(x) for x in onnx_model_paths
-    ) or conv_args.overwrite:
-        _, onnx_outputs = export_models(
-            models_and_onnx_configs=models_and_onnx_configs,
-            opset=conv_args.opset,
+        custom_export_kwargs = dict(
             output_dir=output_model_folder,
-            input_shapes=input_shapes,
-            device=conv_args.device,
-            # dtype="fp16" if fp16 is True else None, # TODO
+            **core_export_kwargs,
         )
+
+        if config.model_type == 'clip':
+            # Handle special case for exporting text and vision models separately
+            from .extra.clip import CLIPTextModelWithProjectionOnnxConfig, CLIPVisionModelWithProjectionOnnxConfig
+            from transformers.models.clip import CLIPTextModelWithProjection, CLIPVisionModelWithProjection
+
+            text_model = CLIPTextModelWithProjection.from_pretrained(
+                model_id, **from_pretrained_kwargs)
+            vision_model = CLIPVisionModelWithProjection.from_pretrained(
+                model_id, **from_pretrained_kwargs)
+
+            export_models(
+                models_and_onnx_configs={
+                    "text_model": (text_model, CLIPTextModelWithProjectionOnnxConfig(text_model.config)),
+                    "vision_model": (vision_model, CLIPVisionModelWithProjectionOnnxConfig(vision_model.config)),
+                },
+                **custom_export_kwargs,
+            )
+
+        elif config.model_type == 'siglip':
+            # Handle special case for exporting text and vision models separately
+            from .extra.siglip import SiglipTextModelOnnxConfig, SiglipVisionModelOnnxConfig
+            from transformers.models.siglip import SiglipTextModel, SiglipVisionModel
+
+            text_model = SiglipTextModel.from_pretrained(
+                model_id, **from_pretrained_kwargs)
+            vision_model = SiglipVisionModel.from_pretrained(
+                model_id, **from_pretrained_kwargs)
+
+            export_models(
+                models_and_onnx_configs={
+                    "text_model": (text_model, SiglipTextModelOnnxConfig(text_model.config)),
+                    "vision_model": (vision_model, SiglipVisionModelOnnxConfig(vision_model.config)),
+                },
+                **custom_export_kwargs,
+            )
+
+        # TODO: Enable once https://github.com/huggingface/optimum/pull/1552 is merged
+        # elif config.model_type == 'clap':
+        #     # Handle special case for exporting text and audio models separately
+        #     from .extra.clap import ClapTextModelWithProjectionOnnxConfig, ClapAudioModelWithProjectionOnnxConfig
+        #     from transformers.models.clap import ClapTextModelWithProjection, ClapAudioModelWithProjection
+
+        #     text_model = ClapTextModelWithProjection.from_pretrained(model_id, **from_pretrained_kwargs)
+        #     audio_model = ClapAudioModelWithProjection.from_pretrained(model_id, **from_pretrained_kwargs)
+
+        #     export_models(
+        #         models_and_onnx_configs={
+        #             "text_model": (text_model, ClapTextModelWithProjectionOnnxConfig(text_model.config)),
+        #             "audio_model": (audio_model, ClapAudioModelWithProjectionOnnxConfig(audio_model.config)),
+        #         },
+        #         **custom_export_kwargs,
+        #     )
+        else:
+            raise Exception(
+                f'Unable to export {config.model_type} model with `--split_modalities`.')
+
+    os.makedirs(os.path.join(output_model_folder, 'onnx'), exist_ok=True)
+
+    if not conv_args.skip_onnxslim:
+        onnx_models = [os.path.join(output_model_folder, x)
+                    for x in os.listdir(output_model_folder) if x.endswith('.onnx')]
+
+        for model in onnx_models:
+            try:
+                slimmed_model = onnxslim.slim(model)
+                check_and_save_model(slimmed_model, model)
+            except Exception as e:
+                print(f"Failed to slim {model}: {e}")
 
     # Step 2. (optional, recommended) quantize the converted model for fast inference and to reduce model size.
     if conv_args.quantize:
-        quantize(onnx_model_paths, model.config.model_type)
 
-    # Step 3. merge decoders.
-    if conv_args.merge_decoders and (
-        os.path.exists(OUTPUT_DECODER_PATH) and
-        os.path.exists(OUTPUT_DECODER_WITH_PAST_PATH)
-    ) and (not os.path.exists(OUTPUT_DECODER_MERGED_PATH) or conv_args.overwrite):
-        print('Merging decoders')
-        merge_decoders(
-            OUTPUT_DECODER_PATH,
-            OUTPUT_DECODER_WITH_PAST_PATH,
-            save_path=OUTPUT_DECODER_MERGED_PATH,
-            strict=False
+        # Possibly update quantize config with model specific defaults
+        use_per_channel_reduce_range = config.model_type not in NO_PER_CHANNEL_REDUCE_RANGE_MODELS
+
+        if quantization_args.per_channel is None:
+            quantization_args.per_channel = use_per_channel_reduce_range
+        if quantization_args.reduce_range is None:
+            quantization_args.reduce_range = use_per_channel_reduce_range
+
+        quantize(
+            output_model_folder,
+            os.path.join(output_model_folder, 'onnx'),
+            quantization_args,
         )
+        with open(os.path.join(output_model_folder, 'quantize_config.json'), 'w') as fp:
+            json.dump(asdict(quantization_args), fp, indent=4)
+
+    # Step 3. Move .onnx files to the 'onnx' subfolder
+    for file in os.listdir(output_model_folder):
+        if file.endswith(('.onnx', '.onnx_data')):
+            shutil.move(os.path.join(output_model_folder, file),
+                        os.path.join(output_model_folder, 'onnx', file))
+
+    # Step 4. Update the generation config if necessary
+    if config.model_type == 'whisper':
+        from transformers import GenerationConfig
+        from .extra.whisper import get_alignment_heads
+
+        generation_config = GenerationConfig.from_pretrained(
+            model_id, **from_pretrained_kwargs)
+        generation_config.alignment_heads = get_alignment_heads(config)
+        generation_config.save_pretrained(output_model_folder)
 
 
 if __name__ == '__main__':
